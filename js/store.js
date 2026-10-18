@@ -15,8 +15,9 @@ function hashStr(s) {
   return 'h' + h.toString(16);
 }
 function uid(p) { return (p || 'id') + '_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8); }
-function daysAgo(n) { const d = new Date(Date.now() - n * 864e5); return d.toISOString().slice(0, 10); }
-function todayStr() { return new Date().toISOString().slice(0, 10); }
+function daysAgo(n) { const d = new Date(Date.now() - n * 864e5); return new Date(d.getTime() - d.getTimezoneOffset() * 6e4).toISOString().slice(0, 10); }
+/* วันที่วันนี้ตามเวลาท้องถิ่น (เดิมใช้ UTC ทำให้หลังเที่ยงคืน–06:59 น. ไทยได้วันที่ย้อนหลัง 1 วัน) */
+function todayStr() { const d = new Date(); return new Date(d.getTime() - d.getTimezoneOffset() * 6e4).toISOString().slice(0, 10); }
 
 /* ---------- ข้อมูลตัวอย่าง (นำเข้าจาก Excel รายงานคงเหลือ) ---------- */
 function buildSeed() {
@@ -157,6 +158,8 @@ const Store = {
             seq: { item: data.items.length, tx: (data.transactions || []).length, user: (data.users || []).length },
           };
           console.log('SQLite: loaded', data.items.length, 'items');
+          /* แก้เลขเอกสารซ้ำจากข้อมูลเก่าก่อนใช้งาน */
+          try { this.dedupeTxNumbers(); } catch (e) { console.error('dedupe error:', e); }
           return this.db;
         }
       } catch (e) { console.error('SQLite load error:', e); }
@@ -166,11 +169,20 @@ const Store = {
       const raw = localStorage.getItem(DB_KEY);
       if (raw) {
         const d = JSON.parse(raw);
-        if (d && Array.isArray(d.items)) { this.db = d; /* sync to SQLite */ if (this._isSQLite()) this.save(); return this.db; }
+        if (d && Array.isArray(d.items)) {
+          this.db = d;
+          /* sync to SQLite */
+          if (this._isSQLite()) this.save();
+          /* แก้เลขเอกสารซ้ำจากข้อมูลเก่าก่อนใช้งาน */
+          try { this.dedupeTxNumbers(); } catch (e) { console.error('dedupe error:', e); }
+          return this.db;
+        }
       }
     } catch (e) { /* ignore */ }
     this.db = buildSeed();
     this.save();
+    /* แก้เลขเอกสารซ้ำจากข้อมูลเก่าก่อนใช้งาน */
+    try { this.dedupeTxNumbers(); } catch (e) { console.error('dedupe error:', e); }
     return this.db;
   },
 
@@ -283,11 +295,61 @@ const Store = {
   getItem(id) { return this.db.items.find(i => i.id === id); },
 
   nextItemCode() { const n = ++this.db.seq.item; return 'IT-' + String(n).padStart(4, '0'); },
+  /* ออกเลขเอกสารจากเลขสูงสุดที่มีจริงใน transactions (+1) เสมอ
+     เดิมใช้ตัวนับ seq แยกตามเครื่อง (localStorage) ทำให้หลายเครื่องออกเลขซ้ำกัน */
   nextTxNo(type) {
     const key = type === 'receive' ? 'receive' : 'issue';
-    const n = ++this.db.seq[key];
     const pre = type === 'receive' ? 'RCV' : 'ISS';
-    return `${pre}-${new Date().getFullYear()}-${String(n).padStart(4, '0')}`;
+    const year = todayStr().slice(0, 4);
+    const pfx = pre + '-' + year + '-';
+    let max = 0;
+    (this.db.transactions || []).forEach(t => {
+      if (t && typeof t.no === 'string' && t.no.indexOf(pfx) === 0) {
+        const n = parseInt(t.no.slice(pfx.length), 10);
+        if (!isNaN(n) && n > max) max = n;
+      }
+    });
+    const seqN = Number(this.db.seq && this.db.seq[key]) || 0;
+    if (seqN > max) max = seqN;
+    const n = max + 1;
+    this.db.seq[key] = n;
+    return `${pre}-${year}-${String(n).padStart(4, '0')}`;
+  },
+
+  /* เรียงเลขเอกสารที่ซ้ำกันให้ไม่ซ้ำ — แก้ข้อมูลเก่าที่ติดค้างจากยุคหลายเครื่องออกเลขพร้อมกัน
+     กติกา deterministic ทุกเครื่องคิดเหมือนกัน: เอกสารที่ updatedAt เก่าสุด (เสมอกันใช้ id เรียงก่อน)
+     เป็นผู้ครองเลขเดิม ที่เหลือไล่เลขใหม่จากเลขมากสุดของชนิด/ปีนั้น +1 แล้วส่งค่าใหม่ขึ้นคลาวด์ */
+  dedupeTxNumbers() {
+    const txs = this.db.transactions || [];
+    const m = no => (typeof no === 'string' ? no.match(/^(RCV|ISS)-(\d{4})-(\d+)$/) : null);
+    const groups = {}, maxNo = {};
+    txs.forEach(t => {
+      const w = t && m(t.no);
+      if (!w) return;
+      (groups[w[0]] = groups[w[0]] || []).push(t);
+      const mk = w[1] + '-' + w[2], n = parseInt(w[3], 10);
+      if (!(mk in maxNo) || n > maxNo[mk]) maxNo[mk] = n;
+    });
+    const reno = [];
+    let changed = false;
+    Object.keys(groups).forEach(k => {
+      const g = groups[k];
+      if (g.length < 2) return;
+      g.sort((a, b) => (a.updatedAt || 0) - (b.updatedAt || 0) || (a.id < b.id ? -1 : 1));
+      const w = m(k), mk = w[1] + '-' + w[2];
+      for (let i = 1; i < g.length; i++) {
+        maxNo[mk]++;
+        g[i].no = w[1] + '-' + w[2] + '-' + String(maxNo[mk]).padStart(4, '0');
+        this._stamp(g[i]);
+        reno.push(g[i]);
+        changed = true;
+      }
+    });
+    if (changed) {
+      this.save();
+      reno.forEach(tx => this._cloudAdd('tx', tx)); /* upsert ตาม id → เลขใหม่ไปทับเลขซ้ำในคลาวด์ */
+    }
+    return changed;
   },
 
   /* ตั้ง qty โดยตรง — ลบ receive เดิมของ item แล้วสร้างใหม่ (สำหรับ Admin แก้ไขจำนวน) */
